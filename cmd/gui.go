@@ -54,6 +54,7 @@ type DownloadJob struct {
 	Warning      string  `json:"warning,omitempty"` // non-fatal issue, job still completed
 	OutputPath   string  `json:"outputPath,omitempty"`
 	CreatedAt    int64   `json:"createdAt"`
+	QueuePosition int    `json:"queuePosition,omitempty"`
 	// progress is the ipatool progress bar feeding this job. It is sampled
 	// whenever the job is serialized for a status response and never exposed.
 	progress *downloadProgress `json:"-"`
@@ -391,6 +392,7 @@ func runGUIServer(host string, port int, noBrowser bool) error {
 	mux.HandleFunc("/api/purchase", handleAPIPurchase)
 	mux.HandleFunc("/api/download", handleAPIDownload)
 	mux.HandleFunc("/api/download/status", handleAPIDownloadStatus)
+	mux.HandleFunc("/api/download/cancel", handleAPIDownloadCancel)
 	mux.HandleFunc("/api/download/file", handleAPIDownloadFile)
 	mux.HandleFunc("/api/download/files", handleAPIListDownloadedFiles)
 	mux.HandleFunc("/api/icloud/status", handleAPIICloudStatus)
@@ -1423,14 +1425,46 @@ func handleAPIDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go func() {
-		defer release()
-		executeDownloadJob(job, req, account, profile)
-	}()
+	queueItem := &downloadQueueItem{
+		job:     job,
+		req:     req,
+		account: account,
+		profile: profile,
+		release: release,
+	}
+	pos, isRunning := guiDownloadQueue.enqueue(queueItem)
+
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"success":       true,
+		"jobId":         jobID,
+		"queued":        !isRunning,
+		"queuePosition": pos,
+	})
+}
+
+func handleAPIDownloadCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JobID == "" {
+		jsonError(w, http.StatusBadRequest, "jobId is required")
+		return
+	}
+
+	cancelled := guiDownloadQueue.cancel(req.JobID)
+	if !cancelled {
+		jsonError(w, http.StatusNotFound, "job not found in queue or already running")
+		return
+	}
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"jobId":   jobID,
+		"message": "cancelled from queue",
 	})
 }
 

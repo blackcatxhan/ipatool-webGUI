@@ -2656,14 +2656,15 @@ async function startAppDownload(bundleId, appId, platform, appName, iconUrl, ver
     return;
   }
 
-  // Prevent double-click
-  if (state.isDownloading) {
-    return;
-  }
-  state.isDownloading = true;
+  const isAlreadyDownloading = state.isDownloading;
 
-  // Open download progress modal
-  openDownloadModal(appName, bundleId, iconUrl, platform);
+  if (!isAlreadyDownloading) {
+    state.isDownloading = true;
+    // Open download progress modal
+    openDownloadModal(appName, bundleId, iconUrl, platform);
+  } else {
+    showToast(state.lang === 'vi' ? 'Đang thêm vào hàng chờ tải xuống...' : (state.lang === 'ru' ? 'Добавление в очередь загрузки...' : 'Adding to download queue...'), 'info');
+  }
 
   try {
     const res = await fetch('/api/download', {
@@ -2683,16 +2684,50 @@ async function startAppDownload(bundleId, appId, platform, appName, iconUrl, ver
     const data = await res.json();
 
     if (!data.success) {
-      state.isDownloading = false;
-      updateDownloadModalError(data.message || t('download_start_error'));
+      if (!isAlreadyDownloading) {
+        state.isDownloading = false;
+        updateDownloadModalError(data.message || t('download_start_error'));
+      } else {
+        showToast(data.message || t('download_start_error'), 'error');
+      }
+      return;
+    }
+
+    if (data.queued) {
+      const appDisplayName = appName || bundleId || 'App';
+      const msg = state.lang === 'vi'
+        ? `Đã thêm "${appDisplayName}" vào hàng chờ tải xuống (vị trí: #${data.queuePosition})`
+        : (state.lang === 'ru'
+          ? `Добавлено "${appDisplayName}" в очередь загрузки (позиция: #${data.queuePosition})`
+          : `Added "${appDisplayName}" to download queue (position: #${data.queuePosition})`);
+      showToast(msg, 'info');
+
+      state.activeDownloads.set(data.jobId, {
+        id: data.jobId,
+        appName: appName || bundleId,
+        bundleId: bundleId,
+        appId: appId ? parseInt(appId, 10) : 0,
+        platform: platform || 'iphone',
+        status: 'queued',
+        progress: 0,
+        queuePosition: data.queuePosition,
+        createdAt: Date.now() / 1000
+      });
+      updateDownloadsBadge();
+      renderActiveDownloadsTab();
+      startActiveDownloadsPolling();
       return;
     }
 
     state.currentJobId = data.jobId;
     trackDownloadProgress(data.jobId, appName, bundleId, iconUrl, platform);
   } catch (err) {
-    state.isDownloading = false;
-    updateDownloadModalError(t('download_start_error'));
+    if (!isAlreadyDownloading) {
+      state.isDownloading = false;
+      updateDownloadModalError(t('download_start_error'));
+    } else {
+      showToast(t('download_start_error'), 'error');
+    }
   }
 }
 
@@ -3754,7 +3789,13 @@ function renderActiveDownloadsTab() {
   listEl.innerHTML = '';
   active.forEach(job => {
     const pct = Math.min(100, Math.max(0, job.progress || 0));
-    const statusLabel = (i18n[state.lang] || i18n.ru)[`batch_download_status_${job.status}`] || job.status;
+    let statusLabel = (i18n[state.lang] || i18n.ru)[`batch_download_status_${job.status}`] || job.status;
+    if (job.status === 'queued' && job.queuePosition) {
+      statusLabel += ` (#${job.queuePosition})`;
+    }
+    const cancelBtn = job.status === 'queued'
+      ? `<button class="btn btn-outline btn-xs" onclick="cancelQueuedDownload('${job.id}')" style="margin-left:8px;padding:2px 8px;font-size:0.75rem">${t('cancel_btn')}</button>`
+      : '';
     const el = document.createElement('div');
     el.className = 'active-download-card';
     const accountLabel = job.accountEmail
@@ -3765,7 +3806,10 @@ function renderActiveDownloadsTab() {
         <div class="active-dl-title" title="${(job.appName || job.bundleId || job.id || '').replace(/"/g, '&quot;')}">
           ${(job.appName || job.bundleId || job.id || '').replace(/</g, '&lt;')}
         </div>
-        <span class="badge ${job.status === 'error' ? 'badge-error' : 'badge-version'}">${statusLabel}</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="badge ${job.status === 'error' ? 'badge-error' : (job.status === 'queued' ? 'badge-info' : 'badge-version')}">${statusLabel}</span>
+          ${cancelBtn}
+        </div>
       </div>
       ${accountLabel}
       <div class="dl-progress-bar-bg">
@@ -3835,6 +3879,29 @@ function stopActiveDownloadsPolling() {
   if (activeDownloadsTimer) {
     clearInterval(activeDownloadsTimer);
     activeDownloadsTimer = null;
+  }
+}
+
+
+async function cancelQueuedDownload(jobId) {
+  try {
+    const res = await fetch('/api/download/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(state.lang === 'vi' ? 'Đã hủy tải xuống khỏi hàng đợi' : (state.lang === 'ru' ? 'Загрузка отменена из очереди' : 'Cancelled download from queue'), 'info');
+      state.activeDownloads.delete(jobId);
+      updateDownloadsBadge();
+      renderActiveDownloadsTab();
+      refreshActiveDownloads();
+    } else {
+      showToast(data.message || 'Error cancelling download', 'error');
+    }
+  } catch (err) {
+    showToast(err.message, 'error');
   }
 }
 
